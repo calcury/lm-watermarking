@@ -14,19 +14,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from argparse import Namespace
 args = Namespace()
 
 arg_dict = {
     'run_gradio': True, 
-    'demo_public': False, 
+    'demo_public': True,
     # 'model_name_or_path': 'facebook/opt-125m', 
     # 'model_name_or_path': 'facebook/opt-1.3b', 
     # 'model_name_or_path': 'facebook/opt-2.7b', 
-    'model_name_or_path': 'facebook/opt-6.7b',
+    'model_name_or_path': os.environ.get('WATERMARK_MODEL', 'facebook/opt-125m'),
+    # 'model_name_or_path': 'facebook/opt-6.7b',
     # 'model_name_or_path': 'facebook/opt-13b',
-    # 'load_fp16' : True,
-    'load_fp16' : False,
+    'load_fp16' : os.environ.get('WATERMARK_FP16', 'false').lower() == 'true',
     'prompt_max_length': None, 
     'max_new_tokens': 200, 
     'generation_seed': 123, 

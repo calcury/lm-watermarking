@@ -22,6 +22,7 @@ from functools import partial
 
 import numpy # for gradio hot reload
 import gradio as gr
+from PIL import Image, ImageDraw, ImageFont
 
 import torch
 
@@ -269,6 +270,77 @@ def generate(prompt, args, model=None, device=None, tokenizer=None):
             args) 
             # decoded_output_with_watermark)
 
+def render_text_image(text, args, tokenizer=None, device=None):
+    """Render text as a PNG with green/red watermark token highlighting."""
+    if tokenizer is None:
+        return None
+
+    token_ids = tokenizer(text, add_special_tokens=False, return_tensors="pt")["input_ids"][0].to(device)
+    detector = WatermarkDetector(
+        vocab=list(tokenizer.get_vocab().values()),
+        gamma=args.gamma,
+        seeding_scheme=args.seeding_scheme,
+        device=device,
+        tokenizer=tokenizer,
+        z_threshold=args.detection_z_threshold,
+        normalizers=[],
+        ignore_repeated_bigrams=False,
+        select_green_tokens=args.select_green_tokens,
+    )
+    if len(token_ids) > detector.min_prefix_len:
+        scores = detector._score_sequence(token_ids, return_green_token_mask=True)
+        green_mask = scores["green_token_mask"]
+    else:
+        green_mask = []
+
+    try:
+        font = ImageFont.truetype("DejaVuSans.ttf", 22)
+        small_font = ImageFont.truetype("DejaVuSans.ttf", 16)
+    except OSError:
+        font = ImageFont.load_default()
+        small_font = font
+
+    width, margin, line_height = 1500, 35, 38
+    image = Image.new("RGB", (width, 120), "white")
+    draw = ImageDraw.Draw(image)
+    x, y = margin, margin
+    max_x = width - margin
+    for index, token_id in enumerate(token_ids.tolist()):
+        piece = tokenizer.decode([token_id], clean_up_tokenization_spaces=False)
+        if not piece:
+            continue
+        # Keep explicit newlines and wrap long lines to fit the image.
+        pieces = piece.split("\\n")
+        for part_index, part in enumerate(pieces):
+            if part_index:
+                x, y = margin, y + line_height
+            if not part:
+                continue
+            bbox = draw.textbbox((0, 0), part, font=font)
+            part_width = bbox[2] - bbox[0]
+            if x + part_width > max_x and x > margin:
+                x, y = margin, y + line_height
+            token_number = index - detector.min_prefix_len
+            if token_number >= 0 and token_number < len(green_mask):
+                color = "#b7f7b7" if green_mask[token_number] else "#ffd0d0"
+                draw.rounded_rectangle((x - 2, y - 2, x + part_width + 2, y + line_height - 4), radius=4, fill=color)
+            draw.text((x, y), part, fill="black", font=font)
+            x += part_width
+        if y + line_height + margin > image.height:
+            image = image.resize((width, image.height + 500))
+            draw = ImageDraw.Draw(image)
+    # Add a compact legend at the bottom.
+    legend_y = y + line_height + 12
+    if legend_y + 30 > image.height:
+        image = image.resize((width, legend_y + 35))
+        draw = ImageDraw.Draw(image)
+    draw.rectangle((margin, legend_y, margin + 18, legend_y + 18), fill="#b7f7b7")
+    draw.text((margin + 25, legend_y - 2), "Green token", fill="black", font=small_font)
+    draw.rectangle((margin + 160, legend_y, margin + 178, legend_y + 18), fill="#ffd0d0")
+    draw.text((margin + 185, legend_y - 2), "Red token", fill="black", font=small_font)
+    return image.crop((0, 0, width, min(image.height, legend_y + 32)))
+
+
 def format_names(s):
     """Format names for the gradio demo interface"""
     s=s.replace("num_tokens_scored","Tokens Counted (T)")
@@ -327,6 +399,13 @@ def run_gradio(args, model=None, device=None, tokenizer=None):
     """Define and launch the gradio demo interface"""
     generate_partial = partial(generate, model=model, device=device, tokenizer=tokenizer)
     detect_partial = partial(detect, device=device, tokenizer=tokenizer)
+
+    def generate_with_images(prompt_text, session_args):
+        result = generate(prompt_text, session_args, model=model, device=device, tokenizer=tokenizer)
+        input_text, truncated, plain_text, watermarked_text, updated_args = result
+        plain_image = render_text_image(plain_text, updated_args, tokenizer=tokenizer, device=device)
+        watermarked_image = render_text_image(watermarked_text, updated_args, tokenizer=tokenizer, device=device)
+        return input_text, truncated, plain_text, watermarked_text, plain_image, watermarked_image, updated_args
 
     with gr.Blocks() as demo:
         # Top section, greeting and instructions
@@ -403,6 +482,9 @@ def run_gradio(args, model=None, device=None, tokenizer=None):
                 with gr.Column(scale=1):
                     # with_watermark_detection_result = gr.Textbox(label="Detection Result", interactive=False,lines=14,max_lines=14)
                     with_watermark_detection_result = gr.Dataframe(headers=["Metric", "Value"],interactive=False,row_count=7,col_count=2)
+            with gr.Row():
+                plain_image = gr.Image(label="Without Watermark (highlighted tokens)", type="pil", interactive=False)
+                watermarked_image = gr.Image(label="With Watermark (highlighted tokens)", type="pil", interactive=False)
 
             redecoded_input = gr.Textbox(visible=False)
             truncation_warning = gr.Number(visible=False)
@@ -525,7 +607,7 @@ def run_gradio(args, model=None, device=None, tokenizer=None):
                 """)
         
         # Register main generation tab click, outputing generations as well as a the encoded+redecoded+potentially truncated prompt and flag
-        generate_btn.click(fn=generate_partial, inputs=[prompt,session_args], outputs=[redecoded_input, truncation_warning, output_without_watermark, output_with_watermark,session_args])
+        generate_btn.click(fn=generate_with_images, inputs=[prompt,session_args], outputs=[redecoded_input, truncation_warning, output_without_watermark, output_with_watermark, plain_image, watermarked_image, session_args])
         # Show truncated version of prompt if truncation occurred
         redecoded_input.change(fn=truncate_prompt, inputs=[redecoded_input,truncation_warning,prompt,session_args], outputs=[prompt,session_args])
         # Call detection when the outputs (of the generate function) are updated
@@ -606,7 +688,7 @@ def run_gradio(args, model=None, device=None, tokenizer=None):
         select_green_tokens.change(fn=detect_partial, inputs=[detection_input,session_args], outputs=[detection_result,session_args])
 
 
-    demo.queue(concurrency_count=3)
+    demo.queue()
 
     if args.demo_public:
         demo.launch(share=True) # exposes app to the internet via randomly generated link

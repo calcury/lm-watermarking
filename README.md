@@ -42,10 +42,31 @@ As a quickstart, the app can be launched with default args (or deployed to a [hu
 which is just a thin wrapper around the demo script.
 ```sh
 python app.py
-gradio app.py # for hot reloading
 # or
 python demo_watermark.py --model_name_or_path facebook/opt-6.7b
 ```
+
+### Google Colab
+
+The `colab` branch renders both generated texts as PNG images with green/red token
+highlighting and launches a shareable Gradio URL. In a Colab cell:
+
+```sh
+!pip install -r requirements.txt
+!python app.py
+```
+
+By default the Colab entry point uses the smaller `facebook/opt-125m` model. To
+select another model, set `WATERMARK_MODEL` before running `app.py`, for example:
+
+```python
+import os
+os.environ["WATERMARK_MODEL"] = "facebook/opt-1.3b"
+%run app.py
+```
+
+The green/red highlighting is a visualization of the existing text watermark; it
+is not an image-generation or pixel-watermark algorithm.
 
 
 ### How to Watermark - A short guide on watermark hyperparameters
