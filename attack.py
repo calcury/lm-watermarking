@@ -24,6 +24,7 @@ class Record:
     z_score: Optional[float]=None; green_fraction: Optional[float]=None
     token_count: Optional[int]=None; detected: Optional[bool]=None
     perplexity: Optional[float]=None; token_edit_ratio: Optional[float]=None
+    requested_edits: Optional[int]=None; actual_edits: Optional[int]=None
     elapsed_seconds: Optional[float]=None; note: str=""
 
 def ids(text, tok): return tok(text, add_special_tokens=False)["input_ids"]
@@ -73,20 +74,29 @@ def paraphrase(text,eps,tok,seed):
 def rewrite(text,model,tok,device,seed):
     prompt='Paraphrase this text, preserve its meaning, return only the paraphrase:\n'+text
     x=tok(prompt,return_tensors='pt',truncation=True,max_length=1024).to(device); torch.manual_seed(seed)
-    y=model.generate(**x,max_new_tokens=min(256,max(32,len(x['input_ids'][0]))),do_sample=True,temperature=.8,top_p=.95)
-    return tok.decode(y[0],skip_special_tokens=True).strip() or text
+    source_len=len(ids(text,tok))
+    y=model.generate(**x,min_new_tokens=max(16, int(source_len*.6)), max_new_tokens=max(32, int(source_len*1.4)), do_sample=True,temperature=.8,top_p=.95)
+    result=tok.decode(y[0],skip_special_tokens=True).strip()
+    return result or text
 
 def t5_span(text,model,tok,device,eps,base_tok,seed):
-    ws=text.split(); n=min(len(ws),budget(text,base_tok,eps)); r=R(seed)
-    for _ in range(n):
+    ws=text.split(); requested=min(len(ws),budget(text,base_tok,eps)); actual=0; r=R(seed)
+    for _ in range(requested):
         if not ws: break
         i=r.randrange(len(ws)); old=ws[i]; masked=' '.join(ws[:i]+['<extra_id_0>']+ws[i+1:])
         x=tok(masked,return_tensors='pt',truncation=True,max_length=1024).to(device)
         ys=model.generate(**x,max_new_tokens=12,num_beams=50,num_return_sequences=20)
+        replaced=False
         for y in ys:
-            s=tok.decode(y,skip_special_tokens=False); m=re.search(r'<extra_id_0>\s*(.*?)\s*(?:<extra_id_1>|$)',s,re.S)
-            if m and m.group(1).strip() and m.group(1).strip()!=old: ws[i]=m.group(1).strip(); break
-    return ' '.join(ws)
+            s=tok.decode(y,skip_special_tokens=False)
+            m=re.search(r'<extra_id_0>\s*(.*?)\s*(?:<extra_id_1>|</s>|$)',s,re.S)
+            if m:
+                candidate=m.group(1).replace('<pad>','').strip()
+                if candidate and candidate != old and '<extra_id_' not in candidate:
+                    ws[i]=candidate; actual += 1; replaced=True; break
+        if not replaced:
+            continue
+    return ' '.join(ws), requested, actual
 
 def score(text,args,tok,device):
     try:
@@ -102,7 +112,7 @@ def ppl(text,model,tok,device):
 def auc(labels,scores):
     p=sum(labels); n=len(labels)-p
     if not p or not n:return None
-    ranks=sorted(zip(scores,labels),reverse=True); s=sum(i+1 for i,(_,y) in enumerate(ranks) if y)
+    ranks=sorted(zip(scores,labels)); s=sum(i+1 for i,(_,y) in enumerate(ranks) if y)
     return (s-p*(p+1)/2)/(p*n)
 
 def load_model(name,seq2seq,device):
@@ -125,22 +135,26 @@ def main():
         for attack in a.attacks:
             for eps in EPSILONS:
                 for source,original in (('unwatermarked',plain),('watermarked',marked)):
-                    t=time.perf_counter()
+                    t=time.perf_counter(); requested=budget(original,target_tok,eps); actual=0
                     try:
-                        if attack=='generative':
-                            if not attacker:
-                                raise RuntimeError('requires --attacker_model')
+                        if eps == 0.0:
+                            attacked=original
+                        elif attack=='generative':
+                            if not attacker: raise RuntimeError('requires --attacker_model')
                             attacked=rewrite(original,attacker,attok,device,sample)
+                            if len(ids(attacked,target_tok)) < max(3, int(.5*len(ids(original,target_tok)))):
+                                raise RuntimeError('invalid_short_output')
+                            actual=max(1, round(edit_ratio(original,attacked,target_tok)*len(ids(original,target_tok))))
                         elif attack in ('lm_span_replacement','t5_span_replacement'):
-                            if not attacker:
-                                raise RuntimeError('requires --attacker_model')
-                            attacked=t5_span(original,attacker,attok,device,eps,target_tok,sample)
+                            if not attacker: raise RuntimeError('requires --attacker_model')
+                            attacked,requested,actual=t5_span(original,attacker,attok,device,eps,target_tok,sample)
                         else:
                             fn={'paraphrasing':paraphrase,'discreet_alterations':discreet,'tokenization':tokenization,'homoglyph':homoglyph,'zero_width':zero_width,'emoji':emoji,'insertion':insertion}[attack]; attacked=fn(original,eps,target_tok,sample)
+                            actual=round(edit_ratio(original,attacked,target_tok)*len(ids(original,target_tok)))
                         d,note=score(attacked,args,target_tok,device)
                         if d is None: raise RuntimeError(note)
-                        records.append(Record(attack,eps,source,sample,'ok',d['z_score'],d['green_fraction'],d['num_tokens_scored'],d['prediction'],ppl(attacked,quality,target_tok,device),edit_ratio(original,attacked,target_tok),None,time.perf_counter()-t))
-                    except Exception as e: records.append(Record(attack,eps,source,sample,'skipped',elapsed_seconds=time.perf_counter()-t,note=str(e)))
+                        records.append(Record(attack,eps,source,sample,'ok',d['z_score'],d['green_fraction'],d['num_tokens_scored'],d['prediction'],ppl(attacked,quality,target_tok,device),edit_ratio(original,attacked,target_tok),requested,actual,time.perf_counter()-t))
+                    except Exception as e: records.append(Record(attack,eps,source,sample,'skipped',requested_edits=requested,elapsed_seconds=time.perf_counter()-t,note=str(e)))
     fields=list(asdict(records[0]).keys())
     with open(a.output_csv,'w',newline='',encoding='utf8') as f: w=csv.DictWriter(f,fieldnames=fields);w.writeheader();w.writerows(asdict(r) for r in records)
     with open(a.matrix_csv,'w',newline='',encoding='utf8') as f:
