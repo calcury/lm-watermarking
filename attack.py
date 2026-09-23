@@ -180,17 +180,29 @@ def t5_span(text: str, level: float, model, tokenizer, device, seed: int = 0) ->
 
 
 def score(text: str, args, tokenizer, device) -> dict:
+    """Score directly with WatermarkDetector instead of parsing Gradio tables."""
     try:
-        rows, _ = detect(text, args, device=device, tokenizer=tokenizer)
-        values = {row[0]: row[1] for row in rows if row and row[0]}
+        from watermark_processor import WatermarkDetector
+        detector = WatermarkDetector(
+            vocab=list(tokenizer.get_vocab().values()),
+            gamma=args.gamma,
+            seeding_scheme=args.seeding_scheme,
+            device=device,
+            tokenizer=tokenizer,
+            z_threshold=args.detection_z_threshold,
+            normalizers=args.normalizers,
+            ignore_repeated_bigrams=args.ignore_repeated_bigrams,
+            select_green_tokens=args.select_green_tokens,
+        )
+        values = detector.detect(text)
         return {
-            "z_score": float(values.get("z-score", "nan")),
-            "green_fraction": float(str(values.get("Fraction of T in Greenlist", "nan")).rstrip("%")) / 100,
-            "token_count": int(values.get("Tokens Counted (T)", 0)),
-            "detected": values.get("Prediction") == "Watermarked",
+            "z_score": float(values["z_score"]),
+            "green_fraction": float(values["green_fraction"]),
+            "token_count": int(values["num_tokens_scored"]),
+            "detected": bool(values["prediction"]),
         }
     except Exception as exc:
-        return {"z_score": None, "green_fraction": None, "token_count": None, "detected": None, "error": str(exc)}
+        return {"z_score": None, "green_fraction": None, "token_count": None, "detected": None, "error": f"{type(exc).__name__}: {exc}"}
 
 
 def build_args() -> Namespace:
@@ -213,6 +225,9 @@ def evaluate(args: Namespace, output_csv: str, attacker_model=None, attacker_tok
     prompt = ("The diamondback terrapin is a species of turtle native to coastal marshes. "
               "It has a distinctive shell and lives in brackish water. The species is")
     _, _, plain, watermarked, _ = generate(prompt, args, model=model, device=device, tokenizer=tokenizer)
+    # Keep only samples long enough for the detector's prefix requirement.
+    if len(tokenizer(plain, add_special_tokens=False)["input_ids"]) < 3 or len(tokenizer(watermarked, add_special_tokens=False)["input_ids"]) < 3:
+        raise RuntimeError("generated sample is too short for watermark detection")
     attacks: dict[str, Callable] = {
         "paraphrasing": paraphrase, "discreet_alterations": discreet,
         "tokenization": tokenization, "homoglyph": homoglyph,
