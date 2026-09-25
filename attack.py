@@ -1,10 +1,20 @@
 # coding=utf-8
 """Colab-friendly robustness evaluation following arXiv:2301.10226v4.
 
-The paper's central budget is epsilon*T token edits.  This script evaluates
-multiple generated samples, writes per-sample records, and writes an aggregate
-TPR/FPR/FNR/AUC evaluation matrix.  A T5/FLAN attacker can be downloaded with
---attacker_model; without it, model-dependent attacks are explicitly skipped.
+The paper reports robustness as **AUC** (detection ROC area) and **PPL**
+(perplexity of the attacked text) at each attack budget epsilon*T.  This script
+uses the same two primary metrics and also keeps TPR/FPR/FNR as diagnostics.
+
+Outputs:
+  attack_records.csv    per-sample records
+  evaluation_matrix.csv full aggregate matrix (AUC, PPL, TPR, FPR, z-scores)
+  paper_metrics.csv     paper-style table: attack, epsilon, auc, ppl
+
+The two model-based span-replacement attacks (lm_span_replacement and
+t5_span_replacement) were removed: with the available T5/FLAN weights they
+accepted zero candidate replacements (actual_edits == 0), so they never
+modified the text and could not produce a meaningful AUC/PPL comparison.
+Paraphrasing is available through --attacker_model when a rewrite LM is wanted.
 """
 import argparse, csv, os, random, re, time
 from dataclasses import dataclass, asdict
@@ -79,25 +89,6 @@ def rewrite(text,model,tok,device,seed):
     result=tok.decode(y[0],skip_special_tokens=True).strip()
     return result or text
 
-def t5_span(text,model,tok,device,eps,base_tok,seed):
-    ws=text.split(); requested=min(len(ws),budget(text,base_tok,eps)); actual=0; r=R(seed)
-    for _ in range(requested):
-        if not ws: break
-        i=r.randrange(len(ws)); old=ws[i]; masked=' '.join(ws[:i]+['<extra_id_0>']+ws[i+1:])
-        x=tok(masked,return_tensors='pt',truncation=True,max_length=1024).to(device)
-        ys=model.generate(**x,max_new_tokens=12,num_beams=50,num_return_sequences=20)
-        replaced=False
-        for y in ys:
-            s=tok.decode(y,skip_special_tokens=False)
-            m=re.search(r'<extra_id_0>\s*(.*?)\s*(?:<extra_id_1>|</s>|$)',s,re.S)
-            if m:
-                candidate=m.group(1).replace('<pad>','').strip()
-                if candidate and candidate != old and '<extra_id_' not in candidate:
-                    ws[i]=candidate; actual += 1; replaced=True; break
-        if not replaced:
-            continue
-    return ' '.join(ws), requested, actual
-
 def score(text,args,tok,device):
     try:
         d=WatermarkDetector(vocab=list(tok.get_vocab().values()),gamma=args.gamma,seeding_scheme=args.seeding_scheme,device=device,tokenizer=tok,z_threshold=args.threshold,normalizers=[],ignore_repeated_bigrams=False,select_green_tokens=True).detect(text)
@@ -120,16 +111,34 @@ def load_model(name, device):
     tok=AutoTokenizer.from_pretrained(name)
     return AutoModelForCausalLM.from_pretrained(name).to(device).eval(),tok
 
+def mean(values):
+    values=[v for v in values if v is not None]
+    return sum(values)/len(values) if values else None
+
+def aggregate(records, attacks):
+    """Build the full evaluation matrix and the paper-style (epsilon, AUC, PPL) table."""
+    matrix, paper = [], []
+    for attack in attacks:
+        for eps in EPSILONS:
+            rows=[r for r in records if r.attack==attack and r.epsilon==eps and r.status=='ok']; wm=[r for r in rows if r.source=='watermarked']; uw=[r for r in rows if r.source=='unwatermarked']; labels=[r.source=='watermarked' for r in rows]; scores=[r.z_score for r in rows]; tpr=sum(r.detected for r in wm)/len(wm) if wm else None; fpr=sum(r.detected for r in uw)/len(uw) if uw else None
+            auc_value=auc(labels,scores) if rows else None
+            ppl_wm, ppl_uw = mean([r.perplexity for r in wm]), mean([r.perplexity for r in uw])
+            matrix.append(dict(attack=attack,epsilon=eps,samples=len(rows),valid_watermarked=len(wm),valid_unwatermarked=len(uw),tpr=tpr,fpr=fpr,fnr=1-tpr if tpr is not None else None,auc=auc_value,mean_z_watermarked=mean([r.z_score for r in wm]),mean_z_unwatermarked=mean([r.z_score for r in uw]),mean_green_watermarked=mean([r.green_fraction for r in wm]),ppl_watermarked=ppl_wm,ppl_unwatermarked=ppl_uw,ppl_all=mean([r.perplexity for r in rows])))
+            # Paper table reports AUC and the PPL of the attacked watermarked text.
+            paper.append(dict(attack=attack,epsilon=eps,auc=auc_value,ppl=ppl_wm if ppl_wm is not None else mean([r.perplexity for r in rows])))
+    return matrix, paper
+
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--model',default=os.getenv('WATERMARK_MODEL','facebook/opt-125m')); p.add_argument('--attacker_model',default=os.getenv('ATTACKER_MODEL',''))
     p.add_argument('--samples',type=int,default=5); p.add_argument('--tokens',type=int,default=200)
     p.add_argument('--quality_model',default=os.getenv('QUALITY_MODEL',''), help='Independent causal LM for paper-style PPL; defaults to the target model.')
-    p.add_argument('--quality',action='store_true', help='Compute perplexity using --quality_model or the target model.')
+    p.add_argument('--no_ppl',action='store_true', help='Skip perplexity. PPL is a paper metric and is computed by default.')
     p.add_argument('--output_csv',default='attack_records.csv'); p.add_argument('--matrix_csv',default='evaluation_matrix.csv')
+    p.add_argument('--paper_csv',default='paper_metrics.csv', help='Paper-style table: attack, epsilon, auc, ppl.')
     p.add_argument('--attacks',nargs='+',default=['paraphrasing','discreet_alterations','tokenization','homoglyph','zero_width','generative','emoji','insertion']); a=p.parse_args()
     device='cuda' if torch.cuda.is_available() else 'cpu'; target_tok=AutoTokenizer.from_pretrained(a.model); target=AutoModelForCausalLM.from_pretrained(a.model).to(device).eval(); attacker,attok=load_model(a.attacker_model,device); quality=None
-    if a.quality:
+    if not a.no_ppl:
         quality_tok=AutoTokenizer.from_pretrained(a.quality_model or a.model)
         quality=target if (a.quality_model or a.model)==a.model else AutoModelForCausalLM.from_pretrained(a.quality_model).to(device).eval()
     else:
@@ -152,9 +161,6 @@ def main():
                             if len(ids(attacked,target_tok)) < max(3, int(.5*len(ids(original,target_tok)))):
                                 raise RuntimeError('invalid_short_output')
                             actual=max(1, round(edit_ratio(original,attacked,target_tok)*len(ids(original,target_tok))))
-                        elif attack in ('lm_span_replacement','t5_span_replacement'):
-                            if not attacker: raise RuntimeError('requires --attacker_model')
-                            attacked,requested,actual=t5_span(original,attacker,attok,device,eps,target_tok,sample)
                         else:
                             fn={'paraphrasing':paraphrase,'discreet_alterations':discreet,'tokenization':tokenization,'homoglyph':homoglyph,'zero_width':zero_width,'emoji':emoji,'insertion':insertion}[attack]; attacked=fn(original,eps,target_tok,sample)
                             actual=round(edit_ratio(original,attacked,target_tok)*len(ids(original,target_tok)))
@@ -164,14 +170,19 @@ def main():
                     except Exception as e: records.append(Record(attack,eps,source,sample,'skipped',requested_edits=requested,elapsed_seconds=time.perf_counter()-t,note=str(e)))
     fields=list(asdict(records[0]).keys())
     with open(a.output_csv,'w',newline='',encoding='utf8') as f: w=csv.DictWriter(f,fieldnames=fields);w.writeheader();w.writerows(asdict(r) for r in records)
+
+    matrix, paper = aggregate(records, a.attacks)
     with open(a.matrix_csv,'w',newline='',encoding='utf8') as f:
-        fs=['attack','epsilon','samples','valid_watermarked','valid_unwatermarked','tpr','fpr','fnr','auc','mean_z_watermarked','mean_z_unwatermarked','mean_green_watermarked','mean_ppl','std_ppl'];w=csv.DictWriter(f,fieldnames=fs);w.writeheader()
-        for attack in a.attacks:
-            for eps in EPSILONS:
-                rows=[r for r in records if r.attack==attack and r.epsilon==eps and r.status=='ok']; wm=[r for r in rows if r.source=='watermarked']; uw=[r for r in rows if r.source=='unwatermarked']; labels=[r.source=='watermarked' for r in rows]; scores=[r.z_score for r in rows]; tpr=sum(r.detected for r in wm)/len(wm) if wm else None; fpr=sum(r.detected for r in uw)/len(uw) if uw else None
-                ppls=[r.perplexity for r in rows if r.perplexity is not None]
-                mean_ppl=sum(ppls)/len(ppls) if ppls else None
-                std_ppl=(sum((x-mean_ppl)**2 for x in ppls)/len(ppls))**.5 if ppls else None
-                w.writerow(dict(attack=attack,epsilon=eps,samples=len(rows),valid_watermarked=len(wm),valid_unwatermarked=len(uw),tpr=tpr,fpr=fpr,fnr=1-tpr if tpr is not None else None,auc=auc(labels,scores) if rows else None,mean_z_watermarked=sum(r.z_score for r in wm)/len(wm) if wm else None,mean_z_unwatermarked=sum(r.z_score for r in uw)/len(uw) if uw else None,mean_green_watermarked=sum(r.green_fraction for r in wm)/len(wm) if wm else None,mean_ppl=mean_ppl,std_ppl=std_ppl))
-    print(f'Wrote {len(records)} records to {a.output_csv}');print(f'Wrote evaluation matrix to {a.matrix_csv}')
+        w=csv.DictWriter(f,fieldnames=list(matrix[0]).keys());w.writeheader();w.writerows(matrix)
+    with open(a.paper_csv,'w',newline='',encoding='utf8') as f:
+        w=csv.DictWriter(f,fieldnames=['attack','epsilon','auc','ppl']);w.writeheader();w.writerows(paper)
+    print(f'Wrote {len(records)} records to {a.output_csv}')
+    print(f'Wrote evaluation matrix to {a.matrix_csv}')
+    print(f'Wrote paper-style metrics to {a.paper_csv}')
+    print('\nPaper-style metrics (epsilon | AUC | PPL):')
+    print(f"{'attack':<22}{'epsilon':>8}{'auc':>10}{'ppl':>10}")
+    for row in paper:
+        auc_text='n/a' if row['auc'] is None else f"{row['auc']:.3f}"
+        ppl_text='n/a' if row['ppl'] is None else f"{row['ppl']:.2f}"
+        print(f"{row['attack']:<22}{row['epsilon']:>8.1f}{auc_text:>10}{ppl_text:>10}")
 if __name__=='__main__': main()

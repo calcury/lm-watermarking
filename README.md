@@ -68,6 +68,34 @@ os.environ["WATERMARK_MODEL"] = "facebook/opt-1.3b"
 The green/red highlighting is a visualization of the existing text watermark; it
 is not an image-generation or pixel-watermark algorithm.
 
+### Robustness evaluation (`attack.py`)
+
+`attack.py` evaluates watermark robustness at the paper's attack budgets
+`epsilon in {0.0, 0.1, 0.3, 0.5, 0.7}`, where the edit budget is `epsilon * T`
+tokens. It reports the same two primary metrics as the paper:
+
+- **AUC** — ROC area between attacked watermarked text and attacked unwatermarked text
+- **PPL** — perplexity of the attacked watermarked text, computed by default
+
+```sh
+!python attack.py --samples 10 --tokens 200
+```
+
+Optional paraphrase rewrite model:
+
+```sh
+!python attack.py --samples 10 --tokens 200 --attacker_model google/flan-t5-base
+```
+
+Use `--quality_model` for an independent oracle LM, or `--no_ppl` to skip PPL.
+Outputs: `attack_records.csv` (per-sample), `evaluation_matrix.csv` (full
+aggregate) and `paper_metrics.csv` (paper-style `attack, epsilon, auc, ppl`).
+
+The two model-based span-replacement attacks (`lm_span_replacement`,
+`t5_span_replacement`) are intentionally not implemented: with the available
+T5/FLAN weights they accepted zero candidate replacements, so they never changed
+the text and could not yield a meaningful AUC/PPL comparison.
+
 
 ### How to Watermark - A short guide on watermark hyperparameters
 What watermark hyperparameters are optimal for your task or for a comparison to new watermarks? We'll provide a brief overview about all important settings below, and best practices for future work. This guide represents our current understanding of optimal settings as of August 2023, and so is a bit more up to date than our ICML 2023 conference paper.
