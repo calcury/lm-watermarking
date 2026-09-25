@@ -10,7 +10,7 @@ import argparse, csv, os, random, re, time
 from dataclasses import dataclass, asdict
 from typing import Optional
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModelForSeq2SeqLM, LogitsProcessorList
+from transformers import AutoTokenizer, AutoModelForCausalLM, LogitsProcessorList
 from watermark_processor import WatermarkLogitsProcessor, WatermarkDetector
 
 EPSILONS = (0.0, .1, .3, .5, .7)
@@ -115,18 +115,25 @@ def auc(labels,scores):
     ranks=sorted(zip(scores,labels)); s=sum(i+1 for i,(_,y) in enumerate(ranks) if y)
     return (s-p*(p+1)/2)/(p*n)
 
-def load_model(name,seq2seq,device):
+def load_model(name, device):
     if not name:return None,None
-    tok=AutoTokenizer.from_pretrained(name); cls=AutoModelForSeq2SeqLM if seq2seq else AutoModelForCausalLM
-    return cls.from_pretrained(name).to(device).eval(),tok
+    tok=AutoTokenizer.from_pretrained(name)
+    return AutoModelForCausalLM.from_pretrained(name).to(device).eval(),tok
 
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--model',default=os.getenv('WATERMARK_MODEL','facebook/opt-125m')); p.add_argument('--attacker_model',default=os.getenv('ATTACKER_MODEL',''))
-    p.add_argument('--attacker_seq2seq',action='store_true'); p.add_argument('--samples',type=int,default=5); p.add_argument('--tokens',type=int,default=200)
-    p.add_argument('--quality',action='store_true'); p.add_argument('--output_csv',default='attack_records.csv'); p.add_argument('--matrix_csv',default='evaluation_matrix.csv')
-    p.add_argument('--attacks',nargs='+',default=['paraphrasing','discreet_alterations','tokenization','homoglyph','zero_width','generative','emoji','lm_span_replacement','t5_span_replacement','insertion']); a=p.parse_args()
-    device='cuda' if torch.cuda.is_available() else 'cpu'; target_tok=AutoTokenizer.from_pretrained(a.model); target=AutoModelForCausalLM.from_pretrained(a.model).to(device).eval(); attacker,attok=load_model(a.attacker_model,a.attacker_seq2seq,device); quality=target if a.quality else None
+    p.add_argument('--samples',type=int,default=5); p.add_argument('--tokens',type=int,default=200)
+    p.add_argument('--quality_model',default=os.getenv('QUALITY_MODEL',''), help='Independent causal LM for paper-style PPL; defaults to the target model.')
+    p.add_argument('--quality',action='store_true', help='Compute perplexity using --quality_model or the target model.')
+    p.add_argument('--output_csv',default='attack_records.csv'); p.add_argument('--matrix_csv',default='evaluation_matrix.csv')
+    p.add_argument('--attacks',nargs='+',default=['paraphrasing','discreet_alterations','tokenization','homoglyph','zero_width','generative','emoji','insertion']); a=p.parse_args()
+    device='cuda' if torch.cuda.is_available() else 'cpu'; target_tok=AutoTokenizer.from_pretrained(a.model); target=AutoModelForCausalLM.from_pretrained(a.model).to(device).eval(); attacker,attok=load_model(a.attacker_model,device); quality=None
+    if a.quality:
+        quality_tok=AutoTokenizer.from_pretrained(a.quality_model or a.model)
+        quality=target if (a.quality_model or a.model)==a.model else AutoModelForCausalLM.from_pretrained(a.quality_model).to(device).eval()
+    else:
+        quality_tok=target_tok
     args=type('A',(),dict(gamma=.25,delta=2.,seeding_scheme='simple_1',threshold=4.))(); prompt='The diamondback terrapin is a species of turtle native to coastal marshes. It has a distinctive shell and lives in brackish water. The species is'
     records=[]
     for sample in range(a.samples):
@@ -153,15 +160,18 @@ def main():
                             actual=round(edit_ratio(original,attacked,target_tok)*len(ids(original,target_tok)))
                         d,note=score(attacked,args,target_tok,device)
                         if d is None: raise RuntimeError(note)
-                        records.append(Record(attack,eps,source,sample,'ok',d['z_score'],d['green_fraction'],d['num_tokens_scored'],d['prediction'],ppl(attacked,quality,target_tok,device),edit_ratio(original,attacked,target_tok),requested,actual,time.perf_counter()-t))
+                        records.append(Record(attack,eps,source,sample,'ok',d['z_score'],d['green_fraction'],d['num_tokens_scored'],d['prediction'],ppl(attacked,quality,quality_tok,device),edit_ratio(original,attacked,target_tok),requested,actual,time.perf_counter()-t))
                     except Exception as e: records.append(Record(attack,eps,source,sample,'skipped',requested_edits=requested,elapsed_seconds=time.perf_counter()-t,note=str(e)))
     fields=list(asdict(records[0]).keys())
     with open(a.output_csv,'w',newline='',encoding='utf8') as f: w=csv.DictWriter(f,fieldnames=fields);w.writeheader();w.writerows(asdict(r) for r in records)
     with open(a.matrix_csv,'w',newline='',encoding='utf8') as f:
-        fs=['attack','epsilon','samples','tpr','fpr','fnr','auc','mean_z_watermarked','mean_z_unwatermarked','mean_green_watermarked','mean_perplexity'];w=csv.DictWriter(f,fieldnames=fs);w.writeheader()
+        fs=['attack','epsilon','samples','valid_watermarked','valid_unwatermarked','tpr','fpr','fnr','auc','mean_z_watermarked','mean_z_unwatermarked','mean_green_watermarked','mean_ppl','std_ppl'];w=csv.DictWriter(f,fieldnames=fs);w.writeheader()
         for attack in a.attacks:
             for eps in EPSILONS:
                 rows=[r for r in records if r.attack==attack and r.epsilon==eps and r.status=='ok']; wm=[r for r in rows if r.source=='watermarked']; uw=[r for r in rows if r.source=='unwatermarked']; labels=[r.source=='watermarked' for r in rows]; scores=[r.z_score for r in rows]; tpr=sum(r.detected for r in wm)/len(wm) if wm else None; fpr=sum(r.detected for r in uw)/len(uw) if uw else None
-                w.writerow(dict(attack=attack,epsilon=eps,samples=len(rows),tpr=tpr,fpr=fpr,fnr=1-tpr if tpr is not None else None,auc=auc(labels,scores) if rows else None,mean_z_watermarked=sum(r.z_score for r in wm)/len(wm) if wm else None,mean_z_unwatermarked=sum(r.z_score for r in uw)/len(uw) if uw else None,mean_green_watermarked=sum(r.green_fraction for r in wm)/len(wm) if wm else None,mean_perplexity=None))
+                ppls=[r.perplexity for r in rows if r.perplexity is not None]
+                mean_ppl=sum(ppls)/len(ppls) if ppls else None
+                std_ppl=(sum((x-mean_ppl)**2 for x in ppls)/len(ppls))**.5 if ppls else None
+                w.writerow(dict(attack=attack,epsilon=eps,samples=len(rows),valid_watermarked=len(wm),valid_unwatermarked=len(uw),tpr=tpr,fpr=fpr,fnr=1-tpr if tpr is not None else None,auc=auc(labels,scores) if rows else None,mean_z_watermarked=sum(r.z_score for r in wm)/len(wm) if wm else None,mean_z_unwatermarked=sum(r.z_score for r in uw)/len(uw) if uw else None,mean_green_watermarked=sum(r.green_fraction for r in wm)/len(wm) if wm else None,mean_ppl=mean_ppl,std_ppl=std_ppl))
     print(f'Wrote {len(records)} records to {a.output_csv}');print(f'Wrote evaluation matrix to {a.matrix_csv}')
 if __name__=='__main__': main()
