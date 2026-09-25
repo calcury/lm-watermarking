@@ -173,7 +173,7 @@ def main():
 
     matrix, paper = aggregate(records, a.attacks)
     with open(a.matrix_csv,'w',newline='',encoding='utf8') as f:
-        w=csv.DictWriter(f,fieldnames=list(matrix[0]).keys());w.writeheader();w.writerows(matrix)
+        w=csv.DictWriter(f,fieldnames=list(matrix[0].keys()));w.writeheader();w.writerows(matrix)
     with open(a.paper_csv,'w',newline='',encoding='utf8') as f:
         w=csv.DictWriter(f,fieldnames=['attack','epsilon','auc','ppl']);w.writeheader();w.writerows(paper)
     print(f'Wrote {len(records)} records to {a.output_csv}')
